@@ -109,20 +109,23 @@ pub struct App {
     program_output: Option<Receiver<String>>,
 }
 
+/// Forward a program's stdout, line by line.
+fn read_lines(out: ChildStdout) -> Receiver<String> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 impl App {
     pub fn new(program_stdout: Option<ChildStdout>) -> App {
-        let program_output = program_stdout.map(|out| {
-            let (tx, rx) = channel();
-            std::thread::spawn(move || {
-                for line in BufReader::new(out).lines() {
-                    let Ok(line) = line else { break };
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            rx
-        });
+        let program_output = program_stdout.map(read_lines);
         let mut expanded = HashSet::new();
         expanded.insert("Arguments".to_string());
         expanded.insert("Locals".to_string());
@@ -168,6 +171,10 @@ impl App {
         let out = std::mem::take(&mut d.out);
         if !out.is_empty() {
             self.push_output(&out);
+        }
+        if let Some(out) = d.new_program_stdout.take() {
+            // The program was restarted.
+            self.program_output = Some(read_lines(out));
         }
         if let Some(rx) = &self.program_output {
             let lines: Vec<String> = rx.try_iter().collect();

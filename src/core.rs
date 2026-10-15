@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::process::ChildStdout;
 use std::time::Duration;
 use wasmtime_debug_dap::types::{Breakpoint, DisassembledInstruction, StackFrame, Variable};
 use wasmtime_debug_dap::{
@@ -110,6 +111,10 @@ pub enum Flow {
     Quit,
 }
 
+/// Starts the program again, returning the new debugger session's client
+/// and the program's stdout (if captured).
+pub type Restart = Box<dyn FnMut() -> Result<(Client, Option<ChildStdout>)>>;
+
 pub struct Dapper {
     pub client: Client,
     /// Output not yet shown to the user.
@@ -130,6 +135,12 @@ pub struct Dapper {
     pub interrupt: Box<dyn FnMut() -> bool>,
     /// Called with program output events while running.
     pub on_output: Box<dyn FnMut(&str)>,
+    /// Starts the program again under a new debugger session, when dapper
+    /// started it (`--run` or `--replay`): returns the new session's
+    /// client and the new program's stdout, if captured.
+    pub restart: Option<Restart>,
+    /// The stdout of a restarted program, for the front-end to pick up.
+    pub new_program_stdout: Option<ChildStdout>,
 }
 
 fn frame_ip(f: &StackFrame) -> Option<(usize, u32)> {
@@ -142,7 +153,31 @@ fn frame_ip(f: &StackFrame) -> Option<(usize, u32)> {
 impl Dapper {
     /// Connect and perform the DAP initialization handshake, stopping on
     /// entry.
-    pub fn connect(mut client: Client) -> Result<Dapper> {
+    pub fn connect(client: Client) -> Result<Dapper> {
+        let mut d = Dapper {
+            client,
+            out: String::new(),
+            state: ProgramState::NotStarted,
+            reversible: false,
+            frames: vec![],
+            selected: 0,
+            breakpoints: vec![],
+            next_bp: 1,
+            list_pos: None,
+            source_cache: HashMap::new(),
+            module_names: HashMap::new(),
+            interrupt: Box::new(|| false),
+            on_output: Box::new(|_| {}),
+            restart: None,
+            new_program_stdout: None,
+        };
+        d.handshake()?;
+        Ok(d)
+    }
+
+    /// Initialize the DAP session, stopping on entry.
+    fn handshake(&mut self) -> Result<()> {
+        let client = &mut self.client;
         let caps = client.request(
             "initialize",
             json!({
@@ -157,36 +192,79 @@ impl Dapper {
         )?;
         client.request("launch", json!({ "stopOnEntry": true }))?;
         client.request("configurationDone", json!({}))?;
-        let mut d = Dapper {
-            client,
-            out: String::new(),
-            state: ProgramState::NotStarted,
-            reversible: caps["supportsStepBack"].as_bool() == Some(true),
-            frames: vec![],
-            selected: 0,
-            breakpoints: vec![],
-            next_bp: 1,
-            list_pos: None,
-            source_cache: HashMap::new(),
-            module_names: HashMap::new(),
-            interrupt: Box::new(|| false),
-            on_output: Box::new(|_| {}),
-        };
+        self.reversible = caps["supportsStepBack"].as_bool() == Some(true);
+        self.state = ProgramState::NotStarted;
+        self.frames.clear();
+        self.selected = 0;
         let mut out = String::new();
-        d.client.wait_event("stopped", &mut |e| {
+        self.client.wait_event("stopped", &mut |e| {
             if e["event"] == "output" {
                 out.push_str(e["body"]["output"].as_str().unwrap_or(""));
             }
         })?;
-        d.out.push_str(&out);
-        if let Ok(body) = d.client.request("modules", json!({})) {
+        self.out.push_str(&out);
+        self.module_names.clear();
+        if let Ok(body) = self.client.request("modules", json!({})) {
             for m in body["modules"].as_array().cloned().unwrap_or_default() {
                 if let (Some(id), Some(name)) = (m["id"].as_i64(), m["name"].as_str()) {
-                    d.module_names.insert(id, name.to_string());
+                    self.module_names.insert(id, name.to_string());
                 }
             }
         }
-        Ok(d)
+        Ok(())
+    }
+
+    /// After the program has exited, start it again from the beginning
+    /// under a new debugger session, keeping breakpoints. Watchpoints
+    /// refer to the old session's memory, so they are deleted.
+    fn restart_program(&mut self) -> Result<()> {
+        let Some(restart) = self.restart.as_mut() else {
+            bail!(
+                "The program has exited, and dapper did not start it, so it cannot be \
+                 restarted. Start the debugger again (or, with `dapper --run` or \
+                 `dapper --replay`, use `start` or `run` to restart)."
+            );
+        };
+        let _ = self.client.request("disconnect", json!({}));
+        let (client, stdout) = restart()?;
+        self.client = client;
+        self.new_program_stdout = stdout;
+        self.handshake()?;
+        let watchpoints: Vec<u32> = self
+            .breakpoints
+            .iter()
+            .filter(|b| matches!(b.kind, BpKind::Data(_)))
+            .map(|b| b.id)
+            .collect();
+        self.breakpoints
+            .retain(|b| !matches!(b.kind, BpKind::Data(_)) && !b.temporary);
+        for id in watchpoints {
+            self.println(&format!(
+                "Watchpoint {id} deleted (watchpoints do not persist across runs)."
+            ));
+        }
+        let mut kinds: Vec<BpKind> = vec![];
+        for b in &self.breakpoints {
+            if !kinds.iter().any(|k| Self::same_class(k, &b.kind)) {
+                kinds.push(b.kind.clone());
+            }
+        }
+        for k in kinds {
+            self.sync_breakpoints(&k)?;
+        }
+        self.println("Restarted the program.");
+        Ok(())
+    }
+
+    /// Whether two breakpoints are set with the same DAP request.
+    fn same_class(a: &BpKind, b: &BpKind) -> bool {
+        match (a, b) {
+            (BpKind::Line { path: a, .. }, BpKind::Line { path: b, .. }) => a == b,
+            (BpKind::Function(_), BpKind::Function(_)) => true,
+            (BpKind::Instruction(_), BpKind::Instruction(_)) => true,
+            (BpKind::Data(_), BpKind::Data(_)) => true,
+            _ => false,
+        }
     }
 
     fn println(&mut self, s: &str) {
@@ -236,6 +314,9 @@ impl Dapper {
             }
             "quit" | "q" | "detach" => return Flow::Quit,
             "start" => self.cmd_start(),
+            "run" | "r" if self.state == ProgramState::Exited => self
+                .restart_program()
+                .and_then(|()| self.resume(Resume::Continue)),
             "continue" | "c" | "run" | "r" => self.resume(Resume::Continue),
             "next" | "n" => self.resume(Resume::Next),
             "step" | "s" => self.resume(Resume::Step),
@@ -447,6 +528,9 @@ impl Dapper {
     // Execution.
 
     fn cmd_start(&mut self) -> Result<()> {
+        if self.state == ProgramState::Exited {
+            self.restart_program()?;
+        }
         if self.state != ProgramState::NotStarted {
             bail!("The program is already running.");
         }
@@ -457,6 +541,9 @@ impl Dapper {
     /// Resume execution and report how it stopped.
     pub fn resume(&mut self, how: Resume) -> Result<()> {
         if self.state == ProgramState::Exited {
+            if self.restart.is_some() {
+                bail!("The program is not being run; use `start` or `run` to start it again.");
+            }
             bail!("The program is not being run.");
         }
         if how.is_reverse() && !self.reversible {
@@ -782,13 +869,7 @@ impl Dapper {
             .breakpoints
             .iter()
             .enumerate()
-            .filter(|(_, b)| match (&b.kind, kind) {
-                (BpKind::Line { path: a, .. }, BpKind::Line { path: b, .. }) => a == b,
-                (BpKind::Function(_), BpKind::Function(_)) => true,
-                (BpKind::Instruction(_), BpKind::Instruction(_)) => true,
-                (BpKind::Data(_), BpKind::Data(_)) => true,
-                _ => false,
-            })
+            .filter(|(_, b)| Self::same_class(&b.kind, kind))
             .map(|(i, _)| i)
             .collect();
         let body = match kind {

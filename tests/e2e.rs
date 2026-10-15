@@ -393,3 +393,42 @@ fn reverse_execution() {
         "#,
     );
 }
+
+#[test]
+fn restart_after_exit() {
+    let (Some(wt), Some(prog)) = (wasmtime(), build_c("debug_tui_c_history")) else {
+        return;
+    };
+    let out = dapper(
+        &wt,
+        &prog,
+        &[],
+        "b debug_tui_c_history.c:32\nc\nwatch counter\nc\nc\nstart\ninfo breakpoints\nc\np counter\n\
+         c\nrun\n",
+    );
+    check(
+        &out,
+        r#"
+        Breakpoint 1, main () at debug_tui_c_history.c:32
+        (dapper) watch counter
+        Watchpoint 2: counter
+        [Program exited]
+        (dapper) c
+        The program is not being run; use `start` or `run` to start it again.
+        (dapper) start
+        Watchpoint 2 deleted (watchpoints do not persist across runs).
+        Restarted the program.
+        Temporary breakpoint 3, main () at debug_tui_c_history.c:27
+        (dapper) info breakpoints
+        1    breakpoint    1     debug_tui_c_history.c:32
+        (dapper) c
+        Breakpoint 1, main () at debug_tui_c_history.c:32
+        (dapper) p counter
+        = 4
+        [Program exited]
+        (dapper) run
+        Restarted the program.
+        Breakpoint 1, main () at debug_tui_c_history.c:32
+        "#,
+    );
+}

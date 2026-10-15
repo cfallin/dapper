@@ -5,7 +5,10 @@ use dapper::{core, tui};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use std::cell::RefCell;
 use std::io::{BufRead, IsTerminal, Write};
+use std::process::Child;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -53,38 +56,56 @@ struct Options {
 
 fn main() -> Result<()> {
     let opts = Options::parse();
-    let (mut child, addr) = match (&opts.run, &opts.replay, &opts.address) {
-        (Some(program), _, _) => {
-            let (c, a) =
-                dapper::spawn_wasmtime(&opts.wasmtime, &opts.wasmtime_args, program, opts.tui)?;
-            (Some(c), a)
+    if opts.run.is_none() && opts.replay.is_none() && opts.address.is_none() {
+        bail!("give a DAP server address, `--run PROGRAM.wasm`, or `--replay TRACE`");
+    }
+    // Start Wasmtime (with `--run` or `--replay`).
+    let spawn = {
+        let (run, replay) = (opts.run.clone(), opts.replay.clone());
+        let (wasmtime, args, tui) = (opts.wasmtime.clone(), opts.wasmtime_args.clone(), opts.tui);
+        move || match (&run, &replay) {
+            (Some(program), _) => dapper::spawn_wasmtime(&wasmtime, &args, program, tui),
+            (None, Some(trace)) => dapper::spawn_wasmtime_replay(&wasmtime, &args, trace, tui),
+            (None, None) => unreachable!(),
         }
-        (None, Some(trace), _) => {
-            let (c, a) = dapper::spawn_wasmtime_replay(
-                &opts.wasmtime,
-                &opts.wasmtime_args,
-                trace,
-                opts.tui,
-            )?;
-            (Some(c), a)
-        }
-        (None, None, Some(a)) => (None, a.clone()),
-        (None, None, None) => {
-            bail!("give a DAP server address, `--run PROGRAM.wasm`, or `--replay TRACE`")
+    };
+    let child: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
+    let addr = match &opts.address {
+        Some(a) => a.clone(),
+        None => {
+            let (c, a) = spawn()?;
+            *child.borrow_mut() = Some(c);
+            a
         }
     };
     let client = dapper::connect(&addr).with_context(|| format!("failed to connect to {addr}"))?;
     let mut d = core::Dapper::connect(client)?;
+    if opts.address.is_none() {
+        // After the program exits, `start` or `run` starts it again.
+        let child = child.clone();
+        d.restart = Some(Box::new(move || {
+            if let Some(mut c) = child.borrow_mut().take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            let (mut c, addr) = spawn()?;
+            let stdout = c.stdout.take();
+            *child.borrow_mut() = Some(c);
+            let client =
+                dapper::connect(&addr).with_context(|| format!("failed to connect to {addr}"))?;
+            Ok((client, stdout))
+        }));
+    }
 
     let result = if opts.tui {
-        let stdout = child.as_mut().and_then(|c| c.stdout.take());
+        let stdout = child.borrow_mut().as_mut().and_then(|c| c.stdout.take());
         tui::run(&mut d, stdout, opts.commands.as_deref())
     } else {
         line_mode(&mut d, opts.commands.as_deref())
     };
     let running = d.state != core::ProgramState::Exited;
     d.disconnect();
-    if let Some(mut c) = child {
+    if let Some(mut c) = child.borrow_mut().take() {
         // Like gdb, quitting kills a program that we started.
         if running {
             let _ = c.kill();

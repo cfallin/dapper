@@ -44,6 +44,10 @@ stop when the program writes the memory holding a value, and show its
 old and new values; they are DAP data breakpoints. When debugging a
 replay, running backward stops at a watched write before it happens.
 
+When dapper started the program (`--run` or `--replay`), `start` or
+`run` after it has exited starts it again under a new debugger session,
+keeping breakpoints (but not watchpoints).
+
 Type `help` for the command list. When stdin is not a terminal, commands
 are read from it and echoed after the prompt, producing a transcript;
 `-x FILE` runs a command file first.
