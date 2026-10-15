@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use dapper::core::Dapper;
-use dapper::tui::{App, Focus, testing::render};
+use dapper::tui::{App, Focus, testing::render, testing::select_variable};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -30,7 +30,7 @@ fn tui_panes() {
 
     app.command(&mut d, "b debug_tui_c.c:60");
     app.command(&mut d, "c");
-    app.command(&mut d, "watch tri.points[1]");
+    app.command(&mut d, "display tri.points[1]");
     app.command(&mut d, "mem &tri");
     let screen = render(&app, &d, 160, 50);
     eprintln!("{screen}");
@@ -40,7 +40,7 @@ fn tui_panes() {
         " Stack ",
         "*#0  main () debug_tui_c.c:60",
         " Variables ",
-        "▾ Watch",
+        "▾ Display",
         "tri.points[1] = struct Point { .x = 4, .y = 0 }",
         "▾ Locals",
         "▸ tri = struct Shape",
@@ -60,7 +60,7 @@ fn tui_panes() {
     app.key(&mut d, key(KeyCode::Tab)); // Stack
     app.key(&mut d, key(KeyCode::Tab)); // Variables
     assert_eq!(app.focus, Focus::Variables);
-    // Rows: Watch, tri.points[1], Arguments, Locals, tri.
+    // Rows: Display, tri.points[1], Arguments, Locals, tri.
     for _ in 0..4 {
         app.key(&mut d, key(KeyCode::Down));
     }
@@ -103,5 +103,79 @@ fn tui_panes() {
     assert!(screen.contains("area = 6 on the heap 30"));
     assert!(screen.contains("[exited]"));
     d.disconnect();
+    child.wait().unwrap();
+}
+
+#[test]
+fn tui_reverse_execution_and_watchpoints() {
+    let (Some(wt), Some(prog)) = (wasmtime(), build_c("debug_tui_c_history")) else {
+        return;
+    };
+    let trace = out_dir().join("tui_history.trace");
+    let status = std::process::Command::new(&wt)
+        .arg("run")
+        .arg(format!("--record={}", trace.display()))
+        .arg(&prog)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (mut child, addr) =
+        dapper::spawn_wasmtime_replay(wt.to_str().unwrap(), &[], trace.to_str().unwrap(), true)
+            .unwrap();
+    let client = dapper::connect(&addr).unwrap();
+    let mut d = Dapper::connect(client).unwrap();
+    assert!(d.reversible);
+    let mut app = App::new(child.stdout.take());
+
+    app.command(&mut d, "b debug_tui_c_history.c:30");
+    app.key(&mut d, key(KeyCode::F(5)));
+    app.key(&mut d, key(KeyCode::F(5)));
+    let screen = render(&app, &d, 160, 50);
+    eprintln!("{screen}");
+    assert!(screen.contains("●   30 ►     add(&acc, sq);"));
+    assert!(screen.contains("S-F5/S-F10/S-F7/S-F8 reverse"));
+
+    // Shift-F10 steps back a line, over the call of `square`.
+    let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+    app.key(&mut d, shift(KeyCode::F(10)));
+    let screen = render(&app, &d, 160, 50);
+    eprintln!("{screen}");
+    assert!(screen.contains("29 ►     int sq = square(i);"));
+
+    // Watch `acc.total` from the variables pane: expand `acc`, select
+    // `total`, and press `w`.
+    for _ in 0..3 {
+        app.key(&mut d, key(KeyCode::Tab));
+    }
+    assert_eq!(app.focus, Focus::Variables);
+    assert!(select_variable(&mut app, "acc = "));
+    app.key(&mut d, key(KeyCode::Enter));
+    assert!(select_variable(&mut app, "total = "));
+    app.key(&mut d, key(KeyCode::Char('w')));
+    app.command(&mut d, "delete 1");
+    // Forward to the write, then (Shift-F5) back to it.
+    app.key(&mut d, key(KeyCode::F(5)));
+    let screen = render(&app, &d, 160, 50);
+    eprintln!("{screen}");
+    assert!(screen.contains("Watchpoint 2: acc.total (memory"));
+    assert!(screen.contains("Old value = 1"));
+    assert!(screen.contains("New value = 5"));
+    assert!(screen.contains("22 ►   acc->count++;"));
+    app.key(&mut d, shift(KeyCode::F(5)));
+    let screen = render(&app, &d, 160, 50);
+    eprintln!("{screen}");
+    assert!(screen.contains("acc.total (running backward: stopped before the write)"));
+    assert!(screen.contains("21 ►   acc->total += v;"));
+    // Shift-F7 / Shift-F8 step back by instructions.
+    app.key(&mut d, shift(KeyCode::F(7)));
+    app.key(&mut d, shift(KeyCode::F(8)));
+    let screen = render(&app, &d, 160, 50);
+    eprintln!("{screen}");
+    assert!(screen.contains("(dapper) reverse-stepi"));
+    assert!(screen.contains("(dapper) reverse-nexti"));
+
+    d.disconnect();
+    let _ = child.kill();
     child.wait().unwrap();
 }

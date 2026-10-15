@@ -15,8 +15,9 @@
 //! ```
 //!
 //! The console accepts every `dapper` command, plus `mem EXPR` (set the
-//! memory view's address) and `watch EXPR` / `unwatch [N]` (watch
-//! expressions in the variables pane).
+//! memory view's address) and `display EXPR` / `undisplay [N]`
+//! (expressions shown in the variables pane). In the variables pane, `w`
+//! sets a watchpoint on the selected variable.
 
 use crate::core::{BpKind, Dapper, Flow, ProgramState, Resume};
 use anyhow::Result;
@@ -65,6 +66,9 @@ struct TreeRow {
     depth: usize,
     text: String,
     reference: i64,
+    /// The variable's name and its parent's `variablesReference`, for
+    /// variables (not scopes or displayed expressions).
+    var: Option<(i64, String)>,
 }
 
 /// A console line, with its kind (for styling).
@@ -94,7 +98,7 @@ pub struct App {
     tree: Vec<TreeRow>,
     tree_cursor: usize,
     expanded: HashSet<String>,
-    watches: Vec<String>,
+    displays: Vec<String>,
     disasm: Vec<(u32, String, bool)>,
     disasm_scroll: usize,
     mem_expr: Option<String>,
@@ -122,7 +126,7 @@ impl App {
         let mut expanded = HashSet::new();
         expanded.insert("Arguments".to_string());
         expanded.insert("Locals".to_string());
-        expanded.insert("Watch".to_string());
+        expanded.insert("Display".to_string());
         App {
             focus: Focus::Console,
             console: vec![],
@@ -138,7 +142,7 @@ impl App {
             tree: vec![],
             tree_cursor: 0,
             expanded,
-            watches: vec![],
+            displays: vec![],
             disasm: vec![],
             disasm_scroll: 0,
             mem_expr: None,
@@ -197,17 +201,17 @@ impl App {
                 self.refresh(d);
                 return;
             }
-            "watch" if !rest.is_empty() => {
-                self.watches.push(rest.to_string());
+            "display" if !rest.is_empty() => {
+                self.displays.push(rest.to_string());
                 self.refresh(d);
                 return;
             }
-            "unwatch" => {
+            "undisplay" => {
                 match rest.parse::<usize>() {
-                    Ok(n) if n < self.watches.len() => {
-                        self.watches.remove(n);
+                    Ok(n) if n < self.displays.len() => {
+                        self.displays.remove(n);
                     }
-                    _ => self.watches.clear(),
+                    _ => self.displays.clear(),
                 }
                 self.refresh(d);
                 return;
@@ -224,7 +228,7 @@ impl App {
         if before != after
             || matches!(
                 cmd,
-                "frame" | "f" | "up" | "down" | "b" | "break" | "tbreak" | "delete" | "d"
+                "frame" | "f" | "up" | "down" | "b" | "break" | "tbreak" | "delete" | "d" | "watch"
             )
         {
             self.stack_cursor = d.selected;
@@ -241,15 +245,21 @@ impl App {
     }
 
     fn resume(&mut self, d: &mut Dapper, how: Resume) {
-        let name = match how {
-            Resume::Continue => "continue",
-            Resume::Next => "next",
-            Resume::Step => "step",
-            Resume::NextI => "nexti",
-            Resume::StepI => "stepi",
-            Resume::Finish => "finish",
+        self.command(d, how.command());
+    }
+
+    /// Set a watchpoint on the variable selected in the variables pane.
+    fn watch_selected(&mut self, d: &mut Dapper) {
+        let Some((parent, name)) = self.tree.get(self.tree_cursor).and_then(|r| r.var.clone())
+        else {
+            self.push_output("Select a variable to watch.");
+            return;
         };
-        self.command(d, name);
+        let r = self.run_debugger(d, |d| d.watch_variable(parent, &name));
+        if let Err(e) = r {
+            self.push_output(&format!("{e:#}"));
+        }
+        self.drain(d);
     }
 
     /// Refresh all panes from the debugger's state.
@@ -320,26 +330,28 @@ impl App {
         if d.state == ProgramState::Exited {
             return;
         }
-        // Watches.
-        if !self.watches.is_empty() {
+        // Displayed expressions.
+        if !self.displays.is_empty() {
             self.tree.push(TreeRow {
-                key: "Watch".into(),
+                key: "Display".into(),
                 depth: 0,
-                text: "Watch".into(),
+                text: "Display".into(),
                 reference: -1,
+                var: None,
             });
-            if self.expanded.contains("Watch") {
-                for (i, w) in self.watches.clone().iter().enumerate() {
+            if self.expanded.contains("Display") {
+                for (i, w) in self.displays.clone().iter().enumerate() {
                     let (text, reference) = match d.evaluate_watch(w) {
                         Ok((v, r)) => (format!("{w} = {v}"), r),
                         Err(e) => (format!("{w}: {e}"), 0),
                     };
-                    let key = format!("Watch/{i}");
+                    let key = format!("Display/{i}");
                     self.tree.push(TreeRow {
                         key: key.clone(),
                         depth: 1,
                         text,
                         reference,
+                        var: None,
                     });
                     self.expand_children(d, &key, reference, 2);
                 }
@@ -354,6 +366,7 @@ impl App {
                 depth: 0,
                 text: name.clone(),
                 reference,
+                var: None,
             });
             self.expand_children(d, &name, reference, 1);
         }
@@ -384,6 +397,7 @@ impl App {
                 depth,
                 text,
                 reference: v.variables_reference,
+                var: Some((reference, v.name.clone())),
             });
             self.expand_children(d, &k, v.variables_reference, depth + 1);
         }
@@ -426,11 +440,15 @@ impl App {
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         // Global keys.
         match k.code {
+            KeyCode::F(5) if shift => return self.resume(d, Resume::ReverseContinue),
             KeyCode::F(5) => return self.resume(d, Resume::Continue),
+            KeyCode::F(10) if shift => return self.resume(d, Resume::ReverseNext),
             KeyCode::F(10) => return self.resume(d, Resume::Next),
             KeyCode::F(11) if shift => return self.resume(d, Resume::Finish),
             KeyCode::F(11) => return self.resume(d, Resume::Step),
+            KeyCode::F(7) if shift => return self.resume(d, Resume::ReverseStepI),
             KeyCode::F(7) => return self.resume(d, Resume::StepI),
+            KeyCode::F(8) if shift => return self.resume(d, Resume::ReverseNextI),
             KeyCode::F(8) => return self.resume(d, Resume::NextI),
             KeyCode::F(9) => return self.toggle_breakpoint(d),
             KeyCode::Tab => {
@@ -505,6 +523,7 @@ impl App {
                         self.rebuild_tree(d);
                     }
                 }
+                KeyCode::Char('w') => self.watch_selected(d),
                 _ => {}
             },
             Focus::Disassembly => match k.code {
@@ -607,8 +626,13 @@ impl App {
             ProgramState::Stopped => "stopped",
             ProgramState::Exited => "exited",
         };
+        let reverse = if d.reversible {
+            "  S-F5/S-F10/S-F7/S-F8 reverse"
+        } else {
+            ""
+        };
         let help = format!(
-            " {} [{state}] │ F5 cont  F10 next  F11 step  S-F11 finish  F7 stepi  F8 nexti  F9 bp  Tab focus  Ctrl-D quit",
+            " {} [{state}] │ F5 cont  F10 next  F11 step  S-F11 finish  F7 stepi  F8 nexti{reverse}  F9 bp  Tab focus  Ctrl-D quit",
             self.status
         );
         f.render_widget(
@@ -913,6 +937,18 @@ pub mod testing {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// Select the first row of the variables pane whose text starts with
+    /// `prefix`; returns whether one was found.
+    pub fn select_variable(app: &mut App, prefix: &str) -> bool {
+        match app.tree.iter().position(|r| r.text.starts_with(prefix)) {
+            Some(i) => {
+                app.tree_cursor = i;
+                true
+            }
+            None => false,
+        }
+    }
 
     /// Render the app to a string, one row per line.
     pub fn render(app: &App, d: &Dapper, w: u16, h: u16) -> String {

@@ -1,5 +1,6 @@
 //! `dapper`: a command-line and terminal-UI client for the Debug Adapter
-//! Protocol, built for Wasmtime's debugger (`wasmtime run --debug-dap`).
+//! Protocol, built for Wasmtime's debugger (`wasmtime run --debug-dap`,
+//! or `wasmtime replay --debug-dap` for recorded executions).
 
 pub mod core;
 pub mod tui;
@@ -23,9 +24,36 @@ pub fn spawn_wasmtime(
     program: &[String],
     capture_stdout: bool,
 ) -> Result<(Child, String)> {
+    spawn_wasmtime_subcommand("run", wasmtime, wasmtime_args, program, capture_stdout)
+}
+
+/// Start `wasmtime replay --debug-dap` on a recorded execution (from
+/// `wasmtime run --record=TRACE`), which can also run backward.
+pub fn spawn_wasmtime_replay(
+    wasmtime: &str,
+    wasmtime_args: &[String],
+    trace: &str,
+    capture_stdout: bool,
+) -> Result<(Child, String)> {
+    spawn_wasmtime_subcommand(
+        "replay",
+        wasmtime,
+        wasmtime_args,
+        &[trace.to_string()],
+        capture_stdout,
+    )
+}
+
+fn spawn_wasmtime_subcommand(
+    subcommand: &str,
+    wasmtime: &str,
+    wasmtime_args: &[String],
+    program: &[String],
+    capture_stdout: bool,
+) -> Result<(Child, String)> {
     let addr = format!("127.0.0.1:{}", free_port()?);
     let mut cmd = Command::new(wasmtime);
-    cmd.arg("run")
+    cmd.arg(subcommand)
         .arg(format!("--debug-dap={addr}"))
         .args(wasmtime_args)
         .args(program)

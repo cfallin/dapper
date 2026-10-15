@@ -39,6 +39,8 @@ pub enum BpKind {
     Function(String),
     /// A code address (module, pc).
     Instruction(u64),
+    /// A watchpoint (DAP data breakpoint), by the server's `dataId`.
+    Data(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +59,49 @@ pub enum Resume {
     NextI,
     StepI,
     Finish,
+    ReverseContinue,
+    ReverseNext,
+    ReverseStep,
+    ReverseNextI,
+    ReverseStepI,
+    ReverseFinish,
 }
+
+impl Resume {
+    /// The command of the text interface for this.
+    pub fn command(self) -> &'static str {
+        match self {
+            Resume::Continue => "continue",
+            Resume::Next => "next",
+            Resume::Step => "step",
+            Resume::NextI => "nexti",
+            Resume::StepI => "stepi",
+            Resume::Finish => "finish",
+            Resume::ReverseContinue => "reverse-continue",
+            Resume::ReverseNext => "reverse-next",
+            Resume::ReverseStep => "reverse-step",
+            Resume::ReverseNextI => "reverse-nexti",
+            Resume::ReverseStepI => "reverse-stepi",
+            Resume::ReverseFinish => "reverse-finish",
+        }
+    }
+
+    pub fn is_reverse(self) -> bool {
+        matches!(
+            self,
+            Resume::ReverseContinue
+                | Resume::ReverseNext
+                | Resume::ReverseStep
+                | Resume::ReverseNextI
+                | Resume::ReverseStepI
+                | Resume::ReverseFinish
+        )
+    }
+}
+
+/// The message for reverse execution of a program that is not a replay.
+const NOT_REVERSIBLE: &str = "Reverse execution requires a recorded execution: record one with \
+     `wasmtime run --record=TRACE ...`, then debug its replay (`dapper --replay TRACE`).";
 
 /// Result of a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +115,8 @@ pub struct Dapper {
     /// Output not yet shown to the user.
     pub out: String,
     pub state: ProgramState,
+    /// Whether the program can run backward (it is a replay).
+    pub reversible: bool,
     /// Stack frames (with parameters) as of the last stop.
     pub frames: Vec<StackFrame>,
     pub selected: usize,
@@ -97,7 +143,7 @@ impl Dapper {
     /// Connect and perform the DAP initialization handshake, stopping on
     /// entry.
     pub fn connect(mut client: Client) -> Result<Dapper> {
-        client.request(
+        let caps = client.request(
             "initialize",
             json!({
                 "clientID": "dapper",
@@ -115,6 +161,7 @@ impl Dapper {
             client,
             out: String::new(),
             state: ProgramState::NotStarted,
+            reversible: caps["supportsStepBack"].as_bool() == Some(true),
             frames: vec![],
             selected: 0,
             breakpoints: vec![],
@@ -195,6 +242,13 @@ impl Dapper {
             "nexti" | "ni" => self.resume(Resume::NextI),
             "stepi" | "si" => self.resume(Resume::StepI),
             "finish" | "fin" => self.resume(Resume::Finish),
+            "reverse-continue" | "rc" => self.resume(Resume::ReverseContinue),
+            "reverse-next" | "rn" => self.resume(Resume::ReverseNext),
+            "reverse-step" | "rs" => self.resume(Resume::ReverseStep),
+            "reverse-nexti" | "rni" => self.resume(Resume::ReverseNextI),
+            "reverse-stepi" | "rsi" => self.resume(Resume::ReverseStepI),
+            "reverse-finish" => self.resume(Resume::ReverseFinish),
+            "watch" => self.cmd_watch(args),
             "interrupt" => {
                 self.println("The program is not running.");
                 Ok(())
@@ -405,8 +459,19 @@ impl Dapper {
         if self.state == ProgramState::Exited {
             bail!("The program is not being run.");
         }
+        if how.is_reverse() && !self.reversible {
+            bail!("{NOT_REVERSIBLE}");
+        }
         if self.state == ProgramState::NotStarted
-            && matches!(how, Resume::Next | Resume::Step | Resume::Finish)
+            && matches!(
+                how,
+                Resume::Next
+                    | Resume::Step
+                    | Resume::Finish
+                    | Resume::ReverseNext
+                    | Resume::ReverseStep
+                    | Resume::ReverseFinish
+            )
         {
             bail!("The program has not been started; use `start` or `continue`.");
         }
@@ -419,6 +484,21 @@ impl Dapper {
             let desc = self.frame_desc(&self.frames[self.selected].clone());
             self.println(&format!("Run till exit from #{}  {desc}", self.selected));
         }
+        if how == Resume::ReverseFinish {
+            self.require_stopped()?;
+            let desc = self.frame_desc(&self.frames[self.selected].clone());
+            self.println(&format!("Run back to call of #{}  {desc}", self.selected));
+        }
+        // Reverse steps other than DAP's `stepBack` (the reverse of `next`)
+        // are run as commands of the server's debug console, which then
+        // reports the stop as usual.
+        let repl = |command: &str, frame: Option<i64>| {
+            let mut a = json!({ "expression": command, "context": "repl" });
+            if let Some(id) = frame {
+                a["frameId"] = json!(id);
+            }
+            ("evaluate", a)
+        };
         let (command, args) = match how {
             Resume::Continue => ("continue", json!({ "threadId": 1 })),
             Resume::Next => ("next", json!({ "threadId": 1 })),
@@ -432,6 +512,15 @@ impl Dapper {
                 json!({ "threadId": 1, "granularity": "instruction" }),
             ),
             Resume::Finish => ("stepOut", json!({ "threadId": 1 })),
+            Resume::ReverseContinue => ("reverseContinue", json!({ "threadId": 1 })),
+            Resume::ReverseNext => ("stepBack", json!({ "threadId": 1 })),
+            Resume::ReverseNextI => (
+                "stepBack",
+                json!({ "threadId": 1, "granularity": "instruction" }),
+            ),
+            Resume::ReverseStep | Resume::ReverseStepI | Resume::ReverseFinish => {
+                repl(how.command(), self.frame_id())
+            }
         };
         // `finish` applies to the selected frame: select it on the server.
         if how == Resume::Finish {
@@ -482,7 +571,7 @@ impl Dapper {
             self.println("[Program exited]");
             return Ok(());
         }
-        let r = self.report(&body, before, how);
+        let r = self.report(&body, before, how, &mut console);
         self.out.push_str(&console);
         r
     }
@@ -492,23 +581,51 @@ impl Dapper {
         stopped: &Value,
         before: Option<(String, usize)>,
         how: Resume,
+        console: &mut String,
     ) -> Result<()> {
         self.refresh_frames()?;
+        let reason = stopped["reason"].as_str().unwrap_or("");
+        match reason {
+            // The server describes these stops in the console: show that
+            // first (with our watchpoint numbers).
+            "data breakpoint" => {
+                let hit = Self::hit_ids(stopped);
+                let mut text = String::from("\n");
+                for line in std::mem::take(console).lines() {
+                    text.push_str(&self.renumber_watchpoint(line, &hit));
+                    text.push('\n');
+                }
+                self.out.push_str(&text);
+            }
+            "beginning of recording" | "end of recording" => {
+                self.out.push('\n');
+                self.out.push_str(&std::mem::take(console));
+                if self.frames.is_empty() {
+                    if reason == "beginning of recording" {
+                        // Before any Wasm ran, as if the program had not
+                        // started.
+                        self.state = ProgramState::NotStarted;
+                    }
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
         if self.frames.is_empty() {
             self.println("Stopped (no Wasm frames on the stack).");
             return Ok(());
         }
-        let reason = stopped["reason"].as_str().unwrap_or("");
         let desc0 = self.frame_desc(&self.frames[0].clone());
         let same_frame = before
             .as_ref()
             .is_some_and(|(n, depth)| *n == self.frames[0].name && *depth == self.frames.len());
         match reason {
+            "data breakpoint" | "beginning of recording" | "end of recording" => {
+                self.println(&desc0);
+                self.print_current_line(0, false);
+            }
             "breakpoint" => {
-                let hit: Vec<i64> = stopped["hitBreakpointIds"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
-                    .unwrap_or_default();
+                let hit = Self::hit_ids(stopped);
                 let bp = self.breakpoints.iter_mut().find(|b| {
                     b.server
                         .as_ref()
@@ -540,19 +657,55 @@ impl Dapper {
                 self.print_current_line(0, false);
             }
             _ => {
-                if how == Resume::Finish {
+                if matches!(how, Resume::Finish | Resume::ReverseFinish) {
                     self.println(&desc0);
                     self.print_current_line(0, false);
                 } else {
                     if !same_frame {
                         self.println(&desc0);
                     }
-                    let instr = matches!(how, Resume::StepI | Resume::NextI);
+                    let instr = matches!(
+                        how,
+                        Resume::StepI | Resume::NextI | Resume::ReverseStepI | Resume::ReverseNextI
+                    );
                     self.print_current_line(0, instr);
                 }
             }
         }
         Ok(())
+    }
+
+    fn hit_ids(stopped: &Value) -> Vec<i64> {
+        stopped["hitBreakpointIds"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default()
+    }
+
+    /// In the server's description of a watchpoint stop, replace its
+    /// watchpoint number with ours (counting the hit).
+    fn renumber_watchpoint(&mut self, line: &str, hit: &[i64]) -> String {
+        let Some(rest) = line.strip_prefix("Watchpoint ") else {
+            return line.to_string();
+        };
+        let Some((num, rest)) = rest.split_once(':') else {
+            return line.to_string();
+        };
+        let Ok(server_id) = num.parse::<i64>() else {
+            return line.to_string();
+        };
+        let bp = self.breakpoints.iter_mut().find(|b| {
+            matches!(b.kind, BpKind::Data(_))
+                && b.server.as_ref().and_then(|s| s.id) == Some(server_id)
+                && hit.contains(&server_id)
+        });
+        match bp {
+            Some(b) => {
+                b.hits += 1;
+                format!("Watchpoint {}:{rest}", b.id)
+            }
+            None => line.to_string(),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -633,6 +786,7 @@ impl Dapper {
                 (BpKind::Line { path: a, .. }, BpKind::Line { path: b, .. }) => a == b,
                 (BpKind::Function(_), BpKind::Function(_)) => true,
                 (BpKind::Instruction(_), BpKind::Instruction(_)) => true,
+                (BpKind::Data(_), BpKind::Data(_)) => true,
                 _ => false,
             })
             .map(|(i, _)| i)
@@ -675,6 +829,17 @@ impl Dapper {
                 self.client
                     .request("setInstructionBreakpoints", json!({ "breakpoints": refs }))?
             }
+            BpKind::Data(_) => {
+                let ids: Vec<Value> = same
+                    .iter()
+                    .map(|&i| match &self.breakpoints[i].kind {
+                        BpKind::Data(id) => json!({ "dataId": id, "accessType": "write" }),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                self.client
+                    .request("setDataBreakpoints", json!({ "breakpoints": ids }))?
+            }
         };
         let results: Vec<Breakpoint> = serde_json::from_value(body["breakpoints"].clone())?;
         for (&i, r) in same.iter().zip(results) {
@@ -711,6 +876,106 @@ impl Dapper {
         Ok(())
     }
 
+    fn cmd_watch(&mut self, args: &str) -> Result<()> {
+        if args.is_empty() {
+            bail!("Argument required (expression to watch, or `-m ADDR LEN`).");
+        }
+        let info = if let Some(rest) = args.strip_prefix("-m ") {
+            let mut parts = rest.split_whitespace();
+            let (Some(addr), Some(len), None) = (parts.next(), parts.next(), parts.next()) else {
+                bail!("Usage: watch -m ADDR LEN");
+            };
+            let addr = match parse_u64(addr) {
+                Ok(a) => a,
+                Err(_) => self.address_of(addr)?,
+            };
+            self.client.request(
+                "dataBreakpointInfo",
+                json!({
+                    "name": memory_reference(addr),
+                    "asAddress": true,
+                    "bytes": parse_u64(len)?,
+                }),
+            )?
+        } else {
+            path::parse(args)?;
+            let mut a = json!({ "name": args });
+            if let Some(id) = self.frame_id() {
+                a["frameId"] = json!(id);
+            }
+            self.client.request("dataBreakpointInfo", a)?
+        };
+        let id = self.add_watchpoint(args, &info)?;
+        self.report_new_watchpoint(id);
+        Ok(())
+    }
+
+    /// Watch a variable shown in the variables tree: member `name` of
+    /// `variables_reference`.
+    pub fn watch_variable(&mut self, variables_reference: i64, name: &str) -> Result<u32> {
+        let info = self.client.request(
+            "dataBreakpointInfo",
+            json!({ "variablesReference": variables_reference, "name": name }),
+        )?;
+        let spec = info["description"].as_str().unwrap_or(name).to_string();
+        let id = self.add_watchpoint(&spec, &info)?;
+        self.report_new_watchpoint(id);
+        Ok(id)
+    }
+
+    /// Add a watchpoint from a `dataBreakpointInfo` response.
+    fn add_watchpoint(&mut self, spec: &str, info: &Value) -> Result<u32> {
+        let Some(data_id) = info["dataId"].as_str() else {
+            bail!(
+                "{}",
+                info["description"]
+                    .as_str()
+                    .unwrap_or("This cannot be watched.")
+            );
+        };
+        let kind = BpKind::Data(data_id.to_string());
+        let id = self.next_bp;
+        self.breakpoints.push(UserBp {
+            id,
+            spec: spec.to_string(),
+            kind: kind.clone(),
+            temporary: false,
+            hits: 0,
+            server: None,
+        });
+        if let Err(e) = self.sync_breakpoints(&kind) {
+            self.breakpoints.pop();
+            return Err(e);
+        }
+        let bp = self.breakpoints.last().unwrap();
+        match &bp.server {
+            Some(s) if s.verified => {
+                self.next_bp += 1;
+                Ok(id)
+            }
+            other => {
+                let msg = other
+                    .as_ref()
+                    .and_then(|s| s.message.clone())
+                    .unwrap_or_else(|| "cannot set watchpoint".into());
+                self.breakpoints.pop();
+                self.sync_breakpoints(&kind)?;
+                bail!("{msg}")
+            }
+        }
+    }
+
+    fn report_new_watchpoint(&mut self, id: u32) {
+        let msg = self
+            .breakpoints
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| b.server.as_ref())
+            .and_then(|s| s.message.clone())
+            .unwrap_or_default();
+        self.println(&format!("Watchpoint {id}: {msg}"));
+    }
+
     fn delete_breakpoint(&mut self, id: u32) -> Result<bool> {
         let Some(i) = self.breakpoints.iter().position(|b| b.id == id) else {
             return Ok(false);
@@ -743,18 +1008,23 @@ impl Dapper {
 
     fn info_breakpoints(&mut self) {
         if self.breakpoints.is_empty() {
-            self.println("No breakpoints.");
+            self.println("No breakpoints or watchpoints.");
             return;
         }
         let mut out = String::from("Num  Type          Hits  Where\n");
         for b in &self.breakpoints {
-            let kind = if b.temporary {
-                "tbreakpoint"
-            } else {
-                "breakpoint"
+            let kind = match (&b.kind, b.temporary) {
+                (BpKind::Data(_), _) => "watchpoint",
+                (_, true) => "tbreakpoint",
+                (_, false) => "breakpoint",
             };
             let _ = writeln!(out, "{:<4} {:<13} {:<5} {}", b.id, kind, b.hits, b.spec);
-            if let Some(m) = b.server.as_ref().and_then(|s| s.message.as_ref()) {
+            if let Some(m) = b.server.as_ref().and_then(|s| s.message.as_deref()) {
+                // For watchpoints on values, show just where the value is.
+                let m = m
+                    .strip_prefix(&format!("{} (", b.spec))
+                    .and_then(|m| m.strip_suffix(')'))
+                    .unwrap_or(m);
                 let _ = writeln!(out, "                         {m}");
             }
         }

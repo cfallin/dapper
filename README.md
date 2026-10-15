@@ -27,10 +27,22 @@ $ dapper 1234
 
 # The full-screen terminal UI:
 $ dapper --tui --run prog.wasm
+
+# Record an execution, then debug its replay, which can also run
+# backward (`reverse-continue`, `reverse-step`, `reverse-next`, ...):
+$ wasmtime run --record=prog.trace prog.wasm
+$ dapper --replay prog.trace
 ```
 
 Wasmtime must be built with the `debug-dap-tui` feature
-(`cargo build --features debug-dap-tui`).
+(`cargo build --features debug-dap-tui`). dapper builds against crates
+of a Wasmtime checkout next to it (`../wasmtime`, on the
+`integrated-debugger` branch of `cfallin/wasmtime`).
+
+Watchpoints (`watch PATH`, or `watch -m ADDR LEN` for a memory range)
+stop when the program writes the memory holding a value, and show its
+old and new values; they are DAP data breakpoints. When debugging a
+replay, running backward stops at a watched write before it happens.
 
 Type `help` for the command list. When stdin is not a terminal, commands
 are read from it and echoed after the prompt, producing a transcript;
@@ -39,8 +51,8 @@ are read from it and echoed after the prompt, producing a transcript;
 ## Terminal UI
 
 `--tui` shows source, stack, variables (an expandable tree of source
-locals and arguments, Wasm locals, operand stack and globals, plus watch
-expressions), disassembly, memory, and a console.
+locals and arguments, Wasm locals, operand stack and globals, plus
+displayed expressions), disassembly, memory, and a console.
 
 | Key             | Action                                         |
 |-----------------|------------------------------------------------|
@@ -48,7 +60,11 @@ expressions), disassembly, memory, and a console.
 | F10 / F11       | next / step                                    |
 | Shift-F11       | finish                                         |
 | F7 / F8         | stepi / nexti                                  |
+| Shift-F5        | reverse-continue (replays)                     |
+| Shift-F10       | reverse-next (replays)                         |
+| Shift-F7 / -F8  | reverse-stepi / reverse-nexti (replays)        |
 | F9              | toggle a breakpoint at the source cursor       |
+| w               | watch the selected variable (variables pane)   |
 | Tab / Shift-Tab | move focus between panes                       |
 | Esc             | focus the console                              |
 | arrows, Enter   | navigate / expand within the focused pane      |
@@ -57,7 +73,8 @@ expressions), disassembly, memory, and a console.
 
 In addition to the usual commands, the console accepts `mem EXPR` (show
 memory at an address or at a value's location, e.g. `mem &buf`), and
-`watch EXPR` / `unwatch [N]`.
+`display EXPR` / `undisplay [N]` (expressions shown in the variables
+pane).
 
 ## Testing
 

@@ -11,13 +11,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A debugger client for Wasmtime's Debug Adapter Protocol server.
 ///
-/// Either connect to a running `wasmtime run --debug-dap ADDR:PORT`, or
-/// use `--run` to start Wasmtime on a program and connect to it.
+/// Either connect to a running `wasmtime run --debug-dap ADDR:PORT`, use
+/// `--run` to start Wasmtime on a program and connect to it, or use
+/// `--replay` to debug a replay of a recorded execution (which can also
+/// run backward).
 #[derive(Parser)]
 #[command(version)]
 struct Options {
     /// Address of a DAP server (`PORT` or `ADDR:PORT`).
-    #[arg(conflicts_with = "run")]
+    #[arg(conflicts_with_all = ["run", "replay"])]
     address: Option<String>,
 
     /// Start Wasmtime on this program (with any following arguments) and
@@ -25,12 +27,17 @@ struct Options {
     #[arg(long, num_args = 1.., value_name = "WASM [ARGS]...", allow_hyphen_values = true)]
     run: Option<Vec<String>>,
 
-    /// The Wasmtime executable to use with `--run`.
+    /// Start Wasmtime on a replay of this trace, recorded with `wasmtime
+    /// run --record=TRACE ...`, and debug it.
+    #[arg(long, value_name = "TRACE", conflicts_with = "run")]
+    replay: Option<String>,
+
+    /// The Wasmtime executable to use with `--run` or `--replay`.
     #[arg(long, default_value = "wasmtime")]
     wasmtime: String,
 
-    /// Extra options for `wasmtime run` (with `--run`), e.g.
-    /// `--wasmtime-arg=-Wgc=y`.
+    /// Extra options for `wasmtime run` or `wasmtime replay` (with `--run`
+    /// or `--replay`), e.g. `--wasmtime-arg=-Wgc=y`.
     #[arg(long = "wasmtime-arg", value_name = "ARG", allow_hyphen_values = true)]
     wasmtime_args: Vec<String>,
 
@@ -46,14 +53,25 @@ struct Options {
 
 fn main() -> Result<()> {
     let opts = Options::parse();
-    let (mut child, addr) = match (&opts.run, &opts.address) {
-        (Some(program), _) => {
+    let (mut child, addr) = match (&opts.run, &opts.replay, &opts.address) {
+        (Some(program), _, _) => {
             let (c, a) =
                 dapper::spawn_wasmtime(&opts.wasmtime, &opts.wasmtime_args, program, opts.tui)?;
             (Some(c), a)
         }
-        (None, Some(a)) => (None, a.clone()),
-        (None, None) => bail!("give a DAP server address, or `--run PROGRAM.wasm`"),
+        (None, Some(trace), _) => {
+            let (c, a) = dapper::spawn_wasmtime_replay(
+                &opts.wasmtime,
+                &opts.wasmtime_args,
+                trace,
+                opts.tui,
+            )?;
+            (Some(c), a)
+        }
+        (None, None, Some(a)) => (None, a.clone()),
+        (None, None, None) => {
+            bail!("give a DAP server address, `--run PROGRAM.wasm`, or `--replay TRACE`")
+        }
     };
     let client = dapper::connect(&addr).with_context(|| format!("failed to connect to {addr}"))?;
     let mut d = core::Dapper::connect(client)?;

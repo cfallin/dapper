@@ -18,13 +18,41 @@ use std::time::Duration;
 
 /// Run `dapper --run PROGRAM` with `script` on stdin; returns stdout.
 fn dapper(wasmtime: &Path, program: &Path, wasmtime_args: &[&str], script: &str) -> String {
+    dapper_on(wasmtime, "--run", program, wasmtime_args, script)
+}
+
+/// Record an execution of `program`, then run `dapper --replay TRACE`
+/// with `script` on stdin; returns stdout.
+fn dapper_replay(wasmtime: &Path, program: &Path, wasmtime_args: &[&str], script: &str) -> String {
+    let trace = out_dir().join(format!(
+        "{}.trace",
+        program.file_stem().unwrap().to_str().unwrap()
+    ));
+    let status = Command::new(wasmtime)
+        .arg("run")
+        .arg(format!("--record={}", trace.display()))
+        .arg(program)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "recording failed");
+    dapper_on(wasmtime, "--replay", &trace, wasmtime_args, script)
+}
+
+fn dapper_on(
+    wasmtime: &Path,
+    mode: &str,
+    target: &Path,
+    wasmtime_args: &[&str],
+    script: &str,
+) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_dapper"));
     cmd.arg("--wasmtime").arg(wasmtime);
     for a in wasmtime_args {
         cmd.arg(format!("--wasmtime-arg={a}"));
     }
-    cmd.arg("--run")
-        .arg(program)
+    cmd.arg(mode)
+        .arg(target)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -140,7 +168,7 @@ fn rust_values() {
         [inlined]
         shape = &Shape::Rect { w: 3, h: 4 }
         %1 = Shape::Rect { w: 3, h: 4 }
-        #1  debug_tui_rust::main () at debug_tui_rust.rs:66
+        #1  debug_tui_rust::main () at debug_tui_rust.rs:62
         %2 = vec![Shape::Circle(1.5), Shape::Rect { w: 3, h: 4 }, Shape::Empty]
         %3 = 2
         %4 = HashMap(len=2) {
@@ -225,6 +253,143 @@ fn interrupt() {
         spin () in
         (dapper) bt
         in spin ()
+        "#,
+    );
+}
+
+#[test]
+fn watchpoints() {
+    let (Some(wt), Some(prog)) = (wasmtime(), build_c("debug_tui_c_history")) else {
+        return;
+    };
+    let out = dapper(
+        &wt,
+        &prog,
+        &[],
+        "b add\nc\nwatch acc->total\nwatch counter\nwatch -m &acc->count 4\nwatch %local0\n\
+         info breakpoints\nc\nc\nc\ndelete 2 4\nc\nc\np counter\nrc\ndelete\nc\n",
+    );
+    check(
+        &out,
+        r#"
+        Breakpoint 1, add (acc=(struct Acc *) 0xfff0, v=1) at debug_tui_c_history.c:21
+        (dapper) watch acc->total
+        Watchpoint 2: acc->total (memory 0xfff0 length 0x4)
+        Watchpoint 3: counter (memory
+        Watchpoint 4: memory 0xfff4 length 0x4
+        (dapper) watch %local0
+        Only values in linear memory can be watched; `%local0` is in local 0.
+        (dapper) info breakpoints
+        2    watchpoint    0     acc->total
+                                 memory 0xfff0 length 0x4
+        4    watchpoint    0     -m &acc->count 4
+        (dapper) c
+        Watchpoint 2: acc->total
+        Old value = 0
+        New value = 1
+        add (acc=(struct Acc *) 0xfff0, v=1) at debug_tui_c_history.c:22
+        22	  acc->count++;
+        (dapper) c
+        Watchpoint 4: memory 0xfff4 length 0x4
+        Old value = 0 (0x0)
+        New value = 1 (0x1)
+        (dapper) c
+        Watchpoint 3: counter
+        New value = 1
+        24	}
+        (dapper) delete 2 4
+        (dapper) c
+        Breakpoint 1, add (acc=(struct Acc *) 0xfff0, v=4)
+        (dapper) c
+        Watchpoint 3: counter
+        Old value = 1
+        New value = 2
+        (dapper) p counter
+        = 2
+        (dapper) rc
+        Reverse execution requires a recorded execution
+        [Program exited]
+        "#,
+    );
+}
+
+#[test]
+fn reverse_execution() {
+    let (Some(wt), Some(prog)) = (wasmtime(), build_c("debug_tui_c_history")) else {
+        return;
+    };
+    let out = dapper_replay(
+        &wt,
+        &prog,
+        &[],
+        "rc\nb debug_tui_c_history.c:29\nc\nc\np i\nrs\nrs\nbt\nrn\nrn\nrn\nrsi\nrni\n\
+         reverse-finish\nc\nreverse-finish\nwatch acc.total\nc\nrc\nrc\ninfo breakpoints\n\
+         delete\nc\nrc\nstart\nc\nc\n",
+    );
+    check(
+        &out,
+        r#"
+        (dapper) rc
+        No more reverse-execution history: at the beginning of the recording.
+        Breakpoint 1, main () at debug_tui_c_history.c:29
+        Breakpoint 1, main () at debug_tui_c_history.c:29
+        (dapper) p i
+        = 2
+        (dapper) rs
+        28	  for (int i = 1; i <= 4; i++) {
+        (dapper) rs
+        add (acc=(struct Acc *) 0xfff0, v=1) at debug_tui_c_history.c:24
+        24	}
+        (dapper) bt
+        in add (acc=(struct Acc *) 0xfff0, v=1) at debug_tui_c_history.c:24
+        in main () at debug_tui_c_history.c:30
+        (dapper) rn
+        23	  counter++;
+        (dapper) rn
+        22	  acc->count++;
+        (dapper) rn
+        21	  acc->total += v;
+        (dapper) rsi
+        => 0x
+        (dapper) rni
+        => 0x
+        (dapper) reverse-finish
+        Run back to call of #0  add (acc=(struct Acc *) 0xfff0, v=1) at debug_tui_c_history.c:20
+        main () at debug_tui_c_history.c:30
+        30	    add(&acc, sq);
+        (dapper) c
+        Breakpoint 1, main () at debug_tui_c_history.c:29
+        (dapper) reverse-finish
+        Run back to call of #0  main ()
+        "#,
+    );
+    // Watchpoints, forward and backward; the ends of the recording.
+    check(
+        &out,
+        r#"
+        (dapper) watch acc.total
+        Watchpoint 2: acc.total (memory
+        (dapper) c
+        Watchpoint 2: acc.total
+        (dapper) rc
+        Watchpoint 2: acc.total (running backward: stopped before the write)
+        Value before = 0
+        Value after = 1
+        21	  acc->total += v;
+        (dapper) rc
+        Breakpoint 1, main () at debug_tui_c_history.c:29
+        (dapper) info breakpoints
+        2    watchpoint    2     acc.total
+        (dapper) c
+        No more execution history: at the end of the recording; continuing will complete it.
+        (dapper) rc
+        No more reverse-execution history: at the beginning of the recording.
+        (dapper) start
+        Temporary breakpoint 3, main () at debug_tui_c_history.c:27
+        (dapper) c
+        No more execution history
+        (dapper) c
+        [Program exited]
         "#,
     );
 }
