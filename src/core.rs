@@ -32,7 +32,10 @@ pub struct UserBp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BpKind {
     /// A source line (the source path as given by the user or the server).
-    Line { path: String, line: u32 },
+    Line {
+        path: String,
+        line: u32,
+    },
     Function(String),
     /// A code address (module, pc).
     Instruction(u64),
@@ -146,8 +149,12 @@ impl Dapper {
 
     /// The banner shown on connection.
     pub fn banner(&mut self) {
-        let mut out = String::from("dapper: Debug Adapter Protocol client for Wasmtime.\nModules:\n");
-        let modules = self.client.request("modules", json!({})).unwrap_or(json!({}));
+        let mut out =
+            String::from("dapper: Debug Adapter Protocol client for Wasmtime.\nModules:\n");
+        let modules = self
+            .client
+            .request("modules", json!({}))
+            .unwrap_or(json!({}));
         for m in modules["modules"].as_array().cloned().unwrap_or_default() {
             let _ = writeln!(
                 out,
@@ -201,7 +208,12 @@ impl Dapper {
             "down" => self.cmd_up_down(args, false),
             "list" | "l" => self.cmd_list(args),
             "x" => self.cmd_examine(args, fmt),
-            "info" | "i" if matches!(args.split_whitespace().next(), Some("breakpoints" | "break" | "b")) => {
+            "info" | "i"
+                if matches!(
+                    args.split_whitespace().next(),
+                    Some("breakpoints" | "break" | "b")
+                ) =>
+            {
                 self.info_breakpoints();
                 Ok(())
             }
@@ -359,7 +371,12 @@ impl Dapper {
         Ok(())
     }
 
-    fn disassemble(&mut self, ip: &str, offset: i64, count: i64) -> Result<Vec<DisassembledInstruction>> {
+    fn disassemble(
+        &mut self,
+        ip: &str,
+        offset: i64,
+        count: i64,
+    ) -> Result<Vec<DisassembledInstruction>> {
         let body = self.client.request(
             "disassemble",
             json!({
@@ -406,8 +423,14 @@ impl Dapper {
             Resume::Continue => ("continue", json!({ "threadId": 1 })),
             Resume::Next => ("next", json!({ "threadId": 1 })),
             Resume::Step => ("stepIn", json!({ "threadId": 1 })),
-            Resume::NextI => ("next", json!({ "threadId": 1, "granularity": "instruction" })),
-            Resume::StepI => ("stepIn", json!({ "threadId": 1, "granularity": "instruction" })),
+            Resume::NextI => (
+                "next",
+                json!({ "threadId": 1, "granularity": "instruction" }),
+            ),
+            Resume::StepI => (
+                "stepIn",
+                json!({ "threadId": 1, "granularity": "instruction" }),
+            ),
             Resume::Finish => ("stepOut", json!({ "threadId": 1 })),
         };
         // `finish` applies to the selected frame: select it on the server.
@@ -464,7 +487,12 @@ impl Dapper {
         r
     }
 
-    fn report(&mut self, stopped: &Value, before: Option<(String, usize)>, how: Resume) -> Result<()> {
+    fn report(
+        &mut self,
+        stopped: &Value,
+        before: Option<(String, usize)>,
+        how: Resume,
+    ) -> Result<()> {
         self.refresh_frames()?;
         if self.frames.is_empty() {
             self.println("Stopped (no Wasm frames on the stack).");
@@ -553,7 +581,12 @@ impl Dapper {
             BreakpointSpec::Function(name) => BpKind::Function(name),
             BreakpointSpec::Pc { module, pc } => {
                 let module = module
-                    .or_else(|| self.frames.get(self.selected).and_then(frame_ip).map(|(m, _)| m))
+                    .or_else(|| {
+                        self.frames
+                            .get(self.selected)
+                            .and_then(frame_ip)
+                            .map(|(m, _)| m)
+                    })
                     .unwrap_or(0);
                 BpKind::Instruction(code_address(module, pc))
             }
@@ -669,7 +702,11 @@ impl Dapper {
             .and_then(|b| b.server.as_ref())
             .and_then(|s| s.message.clone())
             .unwrap_or_default();
-        let kind = if temporary { "Temporary breakpoint" } else { "Breakpoint" };
+        let kind = if temporary {
+            "Temporary breakpoint"
+        } else {
+            "Breakpoint"
+        };
         self.println(&format!("{kind} {id} at {msg}"));
         Ok(())
     }
@@ -694,7 +731,9 @@ impl Dapper {
             return Ok(());
         }
         for a in args.split_whitespace() {
-            let id: u32 = a.parse().map_err(|_| anyhow!("Bad breakpoint number '{a}'"))?;
+            let id: u32 = a
+                .parse()
+                .map_err(|_| anyhow!("Bad breakpoint number '{a}'"))?;
             if !self.delete_breakpoint(id)? {
                 self.println(&format!("No breakpoint number {id}."));
             }
@@ -709,7 +748,11 @@ impl Dapper {
         }
         let mut out = String::from("Num  Type          Hits  Where\n");
         for b in &self.breakpoints {
-            let kind = if b.temporary { "tbreakpoint" } else { "breakpoint" };
+            let kind = if b.temporary {
+                "tbreakpoint"
+            } else {
+                "breakpoint"
+            };
             let _ = writeln!(out, "{:<4} {:<13} {:<5} {}", b.id, kind, b.hits, b.spec);
             if let Some(m) = b.server.as_ref().and_then(|s| s.message.as_ref()) {
                 let _ = writeln!(out, "                         {m}");
@@ -765,7 +808,11 @@ impl Dapper {
 
     fn cmd_up_down(&mut self, args: &str, up: bool) -> Result<()> {
         self.require_stopped()?;
-        let n = if args.is_empty() { 1 } else { parse_u64(args)? as usize };
+        let n = if args.is_empty() {
+            1
+        } else {
+            parse_u64(args)? as usize
+        };
         let i = if up {
             let i = self.selected + n;
             if i >= self.frames.len() {
@@ -885,7 +932,11 @@ impl Dapper {
         let vars = self.scope_variables(scope)?.unwrap_or_default();
         let stack = scope == "Wasm Operand Stack";
         if vars.is_empty() {
-            self.println(if stack { "Operand stack is empty." } else { "No locals." });
+            self.println(if stack {
+                "Operand stack is empty."
+            } else {
+                "No locals."
+            });
         }
         let n = vars.len();
         for (i, v) in vars.into_iter().enumerate() {
@@ -905,7 +956,10 @@ impl Dapper {
                     a["frameId"] = json!(id);
                 }
                 let body = self.client.request("evaluate", a)?;
-                match body["memoryReference"].as_str().and_then(parse_memory_reference) {
+                match body["memoryReference"]
+                    .as_str()
+                    .and_then(parse_memory_reference)
+                {
                     Some(m) => m,
                     None => {
                         // A plain integer value used as an address.
@@ -924,7 +978,10 @@ impl Dapper {
             let data = base64_decode(body["data"].as_str().unwrap_or(""))
                 .ok_or_else(|| anyhow!("invalid memory data"))?;
             if (data.len() as u64) < n {
-                bail!("cannot access memory at address {:#x}", addr + data.len() as u64);
+                bail!(
+                    "cannot access memory at address {:#x}",
+                    addr + data.len() as u64
+                );
             }
             Ok(data)
         };
@@ -934,7 +991,8 @@ impl Dapper {
                 let start = a;
                 let mut bytes = vec![];
                 'outer: loop {
-                    let chunk = read(&mut self.client, a, 64).or_else(|_| read(&mut self.client, a, 1))?;
+                    let chunk =
+                        read(&mut self.client, a, 64).or_else(|_| read(&mut self.client, a, 1))?;
                     for b in chunk {
                         a += 1;
                         if b == 0 || bytes.len() >= 1024 {
@@ -990,7 +1048,9 @@ impl Dapper {
             if i.presentation_hint.as_deref() == Some("invalid") {
                 continue;
             }
-            let pc = parse_memory_reference(&i.address).map(|a| split_code_address(a).1).unwrap_or(0);
+            let pc = parse_memory_reference(&i.address)
+                .map(|a| split_code_address(a).1)
+                .unwrap_or(0);
             let marker = if Some(pc) == cur { "=>" } else { "  " };
             let _ = writeln!(out, "{marker} {pc:#08x}: {}", i.instruction);
         }
@@ -1040,7 +1100,11 @@ impl Dapper {
     }
 
     /// Disassembly around the selected frame's PC (for front-ends).
-    pub fn disassembly_around_pc(&mut self, before: i64, count: i64) -> Result<Vec<DisassembledInstruction>> {
+    pub fn disassembly_around_pc(
+        &mut self,
+        before: i64,
+        count: i64,
+    ) -> Result<Vec<DisassembledInstruction>> {
         let Some(ip) = self
             .frames
             .get(self.selected)

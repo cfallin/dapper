@@ -55,7 +55,11 @@ fn free_port() -> Result<u16> {
 
 /// Start `wasmtime run --debug-dap` and wait until it is listening.
 /// Returns the child and the address to connect to.
-fn spawn_wasmtime(opts: &Options, program: &[String], capture_stdout: bool) -> Result<(Child, String)> {
+fn spawn_wasmtime(
+    opts: &Options,
+    program: &[String],
+    capture_stdout: bool,
+) -> Result<(Child, String)> {
     let addr = format!("127.0.0.1:{}", free_port()?);
     let mut cmd = Command::new(&opts.wasmtime);
     cmd.arg("run")
@@ -143,8 +147,13 @@ fn main() -> Result<()> {
     } else {
         line_mode(&mut d, opts.commands.as_deref())
     };
+    let running = d.state != core::ProgramState::Exited;
     d.disconnect();
     if let Some(mut c) = child {
+        // Like gdb, quitting kills a program that we started.
+        if running {
+            let _ = c.kill();
+        }
         let _ = c.wait();
     }
     result
