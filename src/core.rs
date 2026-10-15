@@ -559,10 +559,10 @@ impl Dapper {
     // Breakpoints.
 
     fn current_path(&self) -> Option<String> {
-        if let Some(f) = self.frames.get(self.selected) {
-            if let Some(p) = Self::frame_path(f) {
-                return Some(p);
-            }
+        if let Some(f) = self.frames.get(self.selected)
+            && let Some(p) = Self::frame_path(f)
+        {
+            return Some(p);
         }
         self.list_pos.as_ref().map(|(p, _)| p.clone())
     }
@@ -870,10 +870,10 @@ impl Dapper {
     /// Resolve a user-given file name against known source paths.
     fn resolve_source_path(&self, f: &str) -> String {
         for fr in &self.frames {
-            if let Some(p) = Self::frame_path(fr) {
-                if p == f || p.ends_with(&format!("/{f}")) {
-                    return p;
-                }
+            if let Some(p) = Self::frame_path(fr)
+                && (p == f || p.ends_with(&format!("/{f}")))
+            {
+                return p;
             }
         }
         for b in &self.breakpoints {
@@ -882,10 +882,9 @@ impl Dapper {
                 .as_ref()
                 .and_then(|s| s.source.as_ref())
                 .and_then(|s| s.path.clone())
+                && (p == f || p.ends_with(&format!("/{f}")))
             {
-                if p == f || p.ends_with(&format!("/{f}")) {
-                    return p;
-                }
+                return p;
             }
         }
         f.to_string()
@@ -1129,6 +1128,19 @@ impl Dapper {
             .as_str()
             .and_then(parse_memory_reference)
             .ok_or_else(|| anyhow!("`{expr}` has no memory address"))
+    }
+
+    /// Evaluate a watch expression: (value, variables reference).
+    pub fn evaluate_watch(&mut self, expr: &str) -> Result<(String, i64)> {
+        let mut a = json!({ "expression": expr, "context": "watch" });
+        if let Some(id) = self.frame_id() {
+            a["frameId"] = json!(id);
+        }
+        let body = self.client.request("evaluate", a)?;
+        Ok((
+            body["result"].as_str().unwrap_or("").to_string(),
+            body["variablesReference"].as_i64().unwrap_or(0),
+        ))
     }
 
     /// Disconnect from the server (the program runs to completion).

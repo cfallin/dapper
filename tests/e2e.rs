@@ -8,68 +8,13 @@
 //! - `WASI_SDK_PATH` for the C test program;
 //! - a Rust toolchain with the `wasm32-wasip1` target for the Rust one.
 
+mod common;
+
+use common::*;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-
-fn wasmtime() -> Option<PathBuf> {
-    let p = std::env::var_os("WASMTIME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../wasmtime/target/debug/wasmtime")
-        });
-    if p.exists() {
-        Some(p)
-    } else {
-        eprintln!("skipping: no wasmtime at {p:?} (set WASMTIME)");
-        None
-    }
-}
-
-fn programs() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs")
-}
-
-fn out_dir() -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("programs");
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-fn build_c(name: &str) -> Option<PathBuf> {
-    let Some(sdk) = std::env::var_os("WASI_SDK_PATH") else {
-        eprintln!("skipping: WASI_SDK_PATH not set");
-        return None;
-    };
-    let out = out_dir().join(format!("{name}.wasm"));
-    let status = Command::new(Path::new(&sdk).join("bin/wasm32-wasip1-clang"))
-        .arg("-g")
-        .arg(programs().join(format!("{name}.c")))
-        .arg("-o")
-        .arg(&out)
-        .env("PATH", "")
-        .status()
-        .unwrap();
-    assert!(status.success());
-    Some(out)
-}
-
-fn build_rust(name: &str) -> Option<PathBuf> {
-    let out = out_dir().join(format!("{name}.wasm"));
-    let status = Command::new("rustc")
-        .args(["--edition", "2024", "--target", "wasm32-wasip1", "-g"])
-        .arg(programs().join(format!("{name}.rs")))
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .ok()?;
-    if !status.success() {
-        eprintln!("skipping: cannot build Rust test program (wasm32-wasip1 target installed?)");
-        return None;
-    }
-    Some(out)
-}
 
 /// Run `dapper --run PROGRAM` with `script` on stdin; returns stdout.
 fn dapper(wasmtime: &Path, program: &Path, wasmtime_args: &[&str], script: &str) -> String {

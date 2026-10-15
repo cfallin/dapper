@@ -9,7 +9,6 @@ description = "A command-line and terminal-UI client for the Debug Adapter Proto
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.29"
 ctrlc = "3"
 ratatui = "0.30"
 rustyline = "17"
