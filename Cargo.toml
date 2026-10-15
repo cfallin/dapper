@@ -1,0 +1,20 @@
+[package]
+name = "dapper"
+version = "0.1.0"
+authors = ["Chris Fallin <chris@cfallin.org>"]
+edition = "2024"
+license = "Apache-2.0"
+description = "A command-line and terminal-UI client for the Debug Adapter Protocol, for Wasmtime's debugger"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ctrlc = "3"
+ratatui = "0.30"
+rustyline = "17"
+serde_json = "1"
+# Shared with Wasmtime's built-in debugger: DAP protocol support, and the
+# command-line front-end helpers (breakpoint syntax, memory formats, help).
+wasmtime-debug-dap = { package = "wasmtime-internal-debug-dap", path = "../wasmtime/crates/debug-dap" }
+wasmtime-debug-info = { package = "wasmtime-internal-debug-info", path = "../wasmtime/crates/debug-info" }
