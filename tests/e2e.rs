@@ -3,7 +3,7 @@
 //! transcripts.
 //!
 //! Requirements (tests are skipped, with a message, if missing):
-//! - `WASMTIME`: path to a `wasmtime` built with `--features debug-tui`
+//! - `WASMTIME`: path to a `wasmtime` built with `--features debug-dap-tui`
 //!   (default: `../wasmtime/target/debug/wasmtime`);
 //! - `WASI_SDK_PATH` for the C test program;
 //! - a Rust toolchain with the `wasm32-wasip1` target for the Rust one.

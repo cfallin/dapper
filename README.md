@@ -29,8 +29,8 @@ $ dapper 1234
 $ dapper --tui --run prog.wasm
 ```
 
-Wasmtime must be built with the `debug-tui` feature
-(`cargo build --features debug-tui`).
+Wasmtime must be built with the `debug-dap-tui` feature
+(`cargo build --features debug-dap-tui`).
 
 Type `help` for the command list. When stdin is not a terminal, commands
 are read from it and echoed after the prompt, producing a transcript;
