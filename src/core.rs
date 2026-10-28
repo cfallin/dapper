@@ -1120,9 +1120,13 @@ impl Dapper {
         let mut out = String::new();
         for (i, f) in self.frames.iter().enumerate() {
             let marker = if i == self.selected { "*" } else { " " };
-            // Inlined frames share their caller's instruction pointer.
-            let inlined = self.frames.get(i + 1).is_some_and(|n| {
-                n.instruction_pointer_reference == f.instruction_pointer_reference
+            // Inlined frames share their caller's physical frame (and
+            // so its instruction pointer, which recursive calls can
+            // share too: without the server's physical-frame index, go
+            // by the instruction pointer).
+            let inlined = self.frames.get(i + 1).is_some_and(|n| match (n.physical_frame, f.physical_frame) {
+                (Some(a), Some(b)) => a == b,
+                _ => n.instruction_pointer_reference == f.instruction_pointer_reference,
             });
             let pcs = if inlined {
                 "[inlined]".to_string()
